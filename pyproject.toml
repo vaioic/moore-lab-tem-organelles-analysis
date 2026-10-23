@@ -1,0 +1,33 @@
+[project]
+name = "moore-lab-tem-organelles-analysis"
+version = "0.1.0"
+description = "Template for analysis projects using uv"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+
+dependencies = [
+    "numpy",
+    "scikit-image",
+    "matplotlib",
+    "tifffile",
+    "hyperspy>=2.5.0",
+    "pandas>=3.1.0",
+    "torch>=2.14.1",
+    "torchvision>=0.29.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "shared"
+module-root = ""
