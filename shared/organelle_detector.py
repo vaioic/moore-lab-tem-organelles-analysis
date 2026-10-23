@@ -1,3 +1,5 @@
+import dataclasses
+from dataclasses import dataclass
 from pathlib import Path
 
 import hyperspy.api as hs
@@ -27,6 +29,17 @@ BINARY_CLASS_MAP = {
 
 
 class TEMImageDataset(Dataset):
+    """
+    Build a Torch-compatible dataset.
+
+    Parameters
+    ----------
+    csv_path : str or Path
+        Path to a CSV-file containing image paths and bounding boxes, exported from QuPath
+    binarize_classes : bool
+        If True, will convert all classes to "Organelle". By default, False.
+    """
+
     def __init__(self, csv_path, binarize_classes=False):
 
         csv_path = Path(csv_path)
@@ -76,6 +89,79 @@ class TEMImageDataset(Dataset):
 
         img_tensor = torchvision.transforms.functional.to_tensor(image)
         return img_tensor, target
+
+
+@dataclass
+class TrainingConfig:
+    """
+    Data class for training settings.
+    """
+
+    learning_rate: float = 0.005
+    momentum: float = 0.9
+    weight_decay: float = 0.0005
+    num_epochs: int = 15
+
+    checkpoint_path = None
+    num_classes: int = 2
+    batch_size: int = 2
+
+    shuffle: bool = True
+    anchor_sizes: tuple = (
+        (32,),
+        (64,),
+        (128,),
+        (320,),
+        (768,),
+    )
+    anchor_aspect_ratios: tuple = (0.5, 1.0, 2.0)
+    augment_images = False
+
+
+def build_model(num_classes):
+
+    weights = torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=weights)
+
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+
+    model.roi_heads.box_predictor = (
+        torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
+            in_features, num_classes
+        )
+    )
+    return model
+
+
+def train(num_classes=2, **kwargs):
+
+    # Generate the TrainingConfig
+    config = generate_training_config(**kwargs)
+
+    # Configure CUDA if a GPU is available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Build the model
+    model = build_model(num_classes)
+    model.to(device)
+
+
+def generate_training_config(**kwargs):
+    """
+    Create a TrainingConfig dataclass.
+    """
+
+    # Initialize a TrainingConfig object
+    config = TrainingConfig()
+
+    # Validate the inputs
+    valid_fields = {f.name for f in dataclasses.fields(TrainingConfig)}
+    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+    # Update the TrainingConfig object
+    config = dataclasses.replace(config, **filtered_kwargs)
+
+    return config
 
 
 def clean_data(root_data_dir, base_output_dir):
