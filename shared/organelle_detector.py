@@ -1,10 +1,11 @@
 import dataclasses
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
 import hyperspy.api as hs
+import numpy as np
 import pandas as pd
 import torch
 import torchvision
@@ -58,6 +59,19 @@ class TrainingConfig:
     augment_images: bool = False
     save_every_n_epochs: int = 5
 
+    class_map: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.class_map:
+            if self.binarize_classes:
+                self.class_map = BINARY_CLASS_MAP
+            else:
+                self.class_map = FULL_CLASS_MAP
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_map) + 1
+
     def save(self, json_path):
         """Saves the current configuration to a JSON file."""
         json_path = Path(json_path)
@@ -106,7 +120,7 @@ class TEMImageDataset(Dataset):
         If True, will convert all classes to "Organelle". By default, False.
     """
 
-    def __init__(self, csv_path, binarize_classes=False):
+    def __init__(self, csv_path, config: TrainingConfig):
 
         csv_path = Path(csv_path)
 
@@ -117,12 +131,10 @@ class TEMImageDataset(Dataset):
         self.images = list(self.df["Image path"].unique())
 
         # Convert class names to an integer id
-        if binarize_classes:
-            self.class_map = BINARY_CLASS_MAP
+        if config.binarize_classes:
             self.df["Class id"] = 1
         else:
-            self.class_map = FULL_CLASS_MAP
-            self.df["Class id"] = self.df["Class"].map(self.class_map)
+            self.df["Class id"] = self.df["Class"].map(config.class_map)
 
     def __len__(self):
         """Return number of images."""
@@ -150,19 +162,23 @@ class TEMImageDataset(Dataset):
         }
 
         # Read the image (expecting a dm4)
-        s = hs.load(image_path)
-        image = s.data
+        img_tensor = image_to_tensor(image_path)
 
-        image = (image - image.min()) / (image.max() - image.min() + 1e-8)
-
-        img_tensor = torchvision.transforms.functional.to_tensor(
-            image.astype("float32")
-        )
         return img_tensor, target
 
-    @property
-    def num_classes(self) -> int:
-        return len(self.class_map) + 1
+
+def image_to_tensor(image_path):
+
+    s = hs.load(image_path)
+
+    image = s.data
+
+    # Normalize the image
+    image = (image - image.min()) / (image.max() - image.min() + 1e-8)
+
+    img_tensor = torchvision.transforms.functional.to_tensor(image.astype("float32"))
+
+    return img_tensor
 
 
 def build_model(num_classes):
@@ -214,9 +230,7 @@ def train(
     config.save(checkpoints_dir / "config.json")
 
     # Set up the datasets
-    training_dataset = TEMImageDataset(
-        training_data_path, binarize_classes=config.binarize_classes
-    )
+    training_dataset = TEMImageDataset(training_data_path, config)
     # print(f"Training dataset length: {len(training_dataset)}")
     training_data_loader = DataLoader(
         training_dataset,
@@ -225,12 +239,9 @@ def train(
         collate_fn=lambda x: tuple(zip(*x)),
     )
     # print(f"Training data loader length: {len(training_data_loader)}")
-    num_classes = training_dataset.num_classes
 
     if validation_data_path:
-        validation_dataset = TEMImageDataset(
-            validation_data_path, binarize_classes=config.binarize_classes
-        )
+        validation_dataset = TEMImageDataset(validation_data_path, config)
         validation_data_loader = DataLoader(
             validation_dataset,
             batch_size=config.batch_size,
@@ -242,6 +253,7 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build the model
+    num_classes = config.num_classes
     model = build_model(num_classes)
     model.to(device)
 
@@ -427,3 +439,207 @@ def clean_data(root_data_dir, base_output_dir):
 
     print(f"Output file written to: {output_file}")
     return output_file
+
+
+def predict_bounding_boxes(
+    model_path,
+    config_path,
+    image_paths,
+    output_dir,
+    confidence_thresh=0.5,
+    save_geojson=True,
+):
+
+    model_path = Path(model_path)
+    if not model_path.is_file():
+        raise FileNotFoundError(f"File not found at path: {model_path}")
+
+    image_paths = [Path(p) for p in image_paths]
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load the TrainingConfig
+    config = TrainingConfig.load(config_path)
+
+    # Invert the class map dict
+    idx_to_class = {v: k for k, v in config.class_map.items()}
+
+    # Build the model
+    model = build_model(config.num_classes)
+
+    checkpoint = torch.load(model_path, map_location=device)
+
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    model.eval()
+
+    results = {}
+    with torch.no_grad():
+        for img_path in image_paths:
+            img_tensor = image_to_tensor(img_path)
+            img_tensor = img_tensor.unsqueeze(0).to(device)
+
+            predictions = model(img_tensor)[0]
+            scores = predictions["scores"].cpu().numpy()
+            keep = scores >= confidence_thresh
+
+            boxes = predictions["boxes"].cpu().numpy()[keep]
+            labels = predictions["labels"].cpu().numpy()[keep]
+            filtered_scores = scores[keep]
+
+            results[img_path] = {
+                "boxes": boxes,
+                "labels": labels,
+                "scores": filtered_scores,
+            }
+
+            # Save data in raw format for SAM2 prediction
+            raw_results = {
+                "image_path": str(img_path),
+                "boxes": boxes.tolist(),
+                "labels": labels.tolist(),
+                "scores": filtered_scores.tolist(),
+            }
+
+            output_fn = img_path.stem
+            json_file_path = output_dir / f"{output_fn}_bbox.json"
+            with open(json_file_path, "w") as f:
+                json.dump(raw_results, f, indent=2)
+            print(f"Bounding box saved to JSON file: {json_file_path}")
+
+            if save_geojson:
+                all_features = []
+                for box, label, score in zip(boxes, labels, filtered_scores):
+                    xmin, ymin, xmax, ymax = box
+                    class_name = idx_to_class.get(str(label), f"Class_{label}")
+
+                    polygon_coords = [
+                        [float(xmin), float(ymin)],
+                        [float(xmax), float(ymin)],
+                        [float(xmax), float(ymax)],
+                        [float(xmin), float(ymax)],
+                        [float(xmin), float(ymin)],
+                    ]
+
+                    feature = {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [polygon_coords],
+                        },
+                        "properties": {
+                            "object_type": "annotation",
+                            "classification": class_name,
+                            "confidence": float(score),
+                        },
+                    }
+                    all_features.append(feature)
+
+                # Construct the final GeoJSON FeatureCollection
+                geojson_collection = {
+                    "type": "FeatureCollection",
+                    "features": all_features,
+                }
+
+                geojson_file_path = output_dir / f"{output_fn}_bbox_geojson.json"
+
+                with open(geojson_file_path, "w") as f:
+                    json.dump(geojson_collection, f, indent=2)
+
+                print(f"Bounding box saved to GeoJSON: {geojson_file_path}")
+
+    return results
+
+
+# TODO: Use SAM to infer the segmentation, convert to GeoJSON
+def segment_sam2(bbox_paths, output_dir):
+
+    bbox_paths = {Path(p) for p in bbox_paths}
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    from segment_anything import SamPredictor, sam_model_registry
+
+    sam = sam_model_registry["vit_h"](
+        checkpoint="./sam_checkpoints/sam_vit_h_4b8939.pth"
+    )
+    predictor = SamPredictor(sam)
+
+    for results_path in bbox_paths:
+        with open(results_path, "r") as f:
+            results = json.load(f)
+
+        img_path = Path(results["image_path"])
+        # Reshape boxes into (N, 4)
+        boxes = np.array(results["boxes"], dtype=np.float32)
+
+        s = hs.load(img_path)
+        image_np = s.data
+
+        image_np = (image_np - image_np.min()) / (
+            image_np.max() - image_np.min() + 1e-8
+        )
+        image_np = (image_np * 255).astype(np.uint8)
+
+        if image_np.ndim == 2:
+            image_np = np.stack([image_np] * 3, axis=-1)
+
+        predictor.set_image(image_np)
+
+        segmentation_masks = []
+        segmentation_scores = []
+        for box in boxes:
+            masks, scores, _ = predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=box,
+                multimask_output=False,
+            )
+
+            segmentation_masks.append(masks)
+            segmentation_scores.append(scores)
+
+    return segmentation_masks, segmentation_scores
+
+
+# def download_sam2_weights(checkpoint_name: str = "sam2.1_hiera_large.pt"):
+
+#     # Check if weight already exists
+#     sam2_checkpoints_dir = Path("../sam2_checkpoints")
+#     sam2_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+#     chkpt_file = sam2_checkpoints_dir / checkpoint_name
+
+#     if chkpt_file.exists():
+#         print(f"Checkpoint {chkpt_file} exists.")
+#         return chkpt_file
+
+#     base_url = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+#     url = f"{base_url}{checkpoint_name}"
+
+#     print(f"Checkpoint not found at {chkpt_file}.")
+#     print(f"Downloading {checkpoint_name} from Meta AI (this may take a minute)...")
+
+#     try:
+#         # A progress bar or basic download handler
+#         def _progress(block_num, block_size, total_size):
+#             downloaded = block_num * block_size
+#             if total_size > 0:
+#                 percent = min(int(downloaded * 100 / total_size), 100)
+#                 print(
+#                     f"\rDownloading: {percent}% ({downloaded / (1024 * 1024):.1f} MB)",
+#                     end="",
+#                 )
+
+#         urllib.request.urlretrieve(url, chkpt_file, reporthook=_progress)
+#         print("\nDownload complete!")
+#     except Exception as e:
+#         if chkpt_file.exists():
+#             chkpt_file.unlink()  # Clean up partial file on failure
+#         raise RuntimeError(f"Failed to download SAM 2 weights from {url}. Error: {e}")
+
+#     return chkpt_file
