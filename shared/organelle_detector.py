@@ -4,11 +4,13 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import hyperspy.api as hs
 import numpy as np
 import pandas as pd
 import torch
 import torchvision
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -36,6 +38,37 @@ BINARY_CLASS_MAP = {
 class TrainingConfig:
     """
     Data class for training settings.
+
+    Attributes
+    ----------
+    learning_rate : float, optional
+        Optimizer learning rate. Default is 0.005.
+    momentum : float, optional
+        SGD momentum factor. Default is 0.9.
+    weight_decay : float, optional
+        L2 weight decay penalty. Default is 0.0005.
+    num_epochs : int, optional
+        Total number of training epochs. Default is 15.
+    checkpoint_path : str or Path, optional
+        Path to a checkpoint file to resume training from. Default is None.
+    binarize_classes : bool, optional
+        If True, collapses classes to a binary foreground/background mapping.
+        Default is False.
+    batch_size : int, optional
+        Number of images per batch. Default is 2.
+    shuffle : bool, optional
+        Whether to shuffle training data each epoch. Default is True.
+    anchor_sizes : tuple of tuple of int, optional
+        Anchor box sizes for the RPN. Default is ((32,), (64,), (128,), (320,), (768,)).
+    anchor_aspect_ratios : tuple of float, optional
+        Anchor aspect ratios for the RPN. Default is (0.5, 1.0, 2.0).
+    augment_images : bool, optional
+        Whether to apply data augmentations. Default is False.
+    save_every_n_epochs : int, optional
+        Frequency of checkpoint saving. Default is 5.
+    class_map : dict, optional
+        Mapping dictionary linking class names to integer IDs.
+        Automatically populated if empty based on `binarize_classes`.
     """
 
     learning_rate: float = 0.005
@@ -59,7 +92,7 @@ class TrainingConfig:
     augment_images: bool = False
     save_every_n_epochs: int = 5
 
-    class_map: dict = field(default_factory=dict)
+    class_map: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.class_map:
@@ -70,6 +103,7 @@ class TrainingConfig:
 
     @property
     def num_classes(self) -> int:
+        """Total number of classes including background"""
         return len(self.class_map) + 1
 
     def save(self, json_path):
@@ -83,7 +117,7 @@ class TrainingConfig:
 
     @classmethod
     def load(cls, json_path):
-        """Loads a TrainingConfig instance from an existing JSON file safely."""
+        """Loads a TrainingConfig instance from an existing JSON file"""
         json_path = Path(json_path)
         if not json_path.exists():
             raise FileNotFoundError(f"Configuration file not found at {json_path}")
@@ -107,6 +141,20 @@ class TrainingConfig:
 
         return cls(**filtered_data)
 
+    def from_args(**kwargs):
+        """
+        Create a TrainingConfig dataclass from passed arguments
+        """
+
+        # Initialize a TrainingConfig object
+        config = TrainingConfig()
+
+        # Validate the inputs
+        valid_fields = {f.name for f in dataclasses.fields(TrainingConfig)}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+        return dataclasses.replace(config, **filtered_kwargs)
+
 
 class TEMImageDataset(Dataset):
     """
@@ -116,8 +164,19 @@ class TEMImageDataset(Dataset):
     ----------
     csv_path : str or Path
         Path to a CSV-file containing image paths and bounding boxes, exported from QuPath
-    binarize_classes : bool
-        If True, will convert all classes to "Organelle". By default, False.
+    config : TrainingConfig
+        Configuration parameters for the dataset (primarily binarization of classes and
+        the class map)
+
+    Attributes
+    ----------
+    df : pandas.DataFrame
+        Annotations imported from QuPath containing the image path, bounding box
+        coordinates, and classification.
+    images : list of str
+        Unique image paths extracted from the dataset.
+    class_map : dict
+        Dictionary that maps the class names to integer IDs.
     """
 
     def __init__(self, csv_path, config: TrainingConfig):
@@ -130,7 +189,7 @@ class TEMImageDataset(Dataset):
         # Get the number of cells
         self.images = list(self.df["Image path"].unique())
 
-        # Convert class names to an integer id
+        # Define the class map
         if config.binarize_classes:
             self.df["Class id"] = 1
         else:
@@ -141,8 +200,7 @@ class TEMImageDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        # image, target
-
+        # The output should match what is needed for pytorch DataLoader.
         image_path = self.images[idx]
 
         # Get the subset of data that match the image path
@@ -162,26 +220,92 @@ class TEMImageDataset(Dataset):
         }
 
         # Read the image (expecting a dm4)
-        img_tensor = image_to_tensor(image_path)
+        image = read_image(image_path)
+        img_tensor = image_to_tensor(image)
 
         return img_tensor, target
 
 
-def image_to_tensor(image_path):
+def read_image(image_path):
+    """
+    Read in an image.
 
-    s = hs.load(image_path)
+    Will use different readers depending on filetype.
 
-    image = s.data
+    Parameters
+    ----------
+    image_path : str or Path
+        Path to image file.
+
+    Raises
+    ------
+    FileNotFoundError
+        Image file was not found at the provided path.
+    ValueError
+        Image file contains a currently unsupported file extension.
+    """
+
+    image_path = Path(image_path)
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"Could not find file {image_path}.")
+
+    ext = image_path.suffix.lower()
+
+    match ext:
+        case ".dm4":
+            s = hs.load(image_path)
+            image = s.data
+        case ".tiff" | ".tif":
+            import tifffile
+
+            image = tifffile.imread(image_path)
+        case ".png" | ".jpg" | ".jpeg":
+            image = np.array(Image.open(image_path))
+        case _:
+            raise ValueError(f"Unsupported file extension: {ext}")
 
     # Normalize the image
+    image = image.astype(np.float32)
     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
+
+
+def image_to_tensor(image):
+    """
+    Convert image to torch tensor.
+
+    Parameters
+    ----------
+    image : ndarray
+        Image data to convert
+
+    Returns
+    -------
+    img_tensor : torch.tensor
+        Float 32 Torch tensor.
+    """
 
     img_tensor = torchvision.transforms.functional.to_tensor(image.astype("float32"))
 
     return img_tensor
 
 
-def build_model(num_classes):
+def build_rcnn_model(num_classes):
+    """
+    Build the Faster-RCNN model.
+
+    Future uses could expand this to include other models.
+
+    Parameters
+    ----------
+    num_classes : int
+        Number of classes that you want to classify.
+
+    Returns
+    -------
+    nodel : FasterRCNN
+        Faster-RCNN model.
+    """
 
     weights = torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights=weights)
@@ -196,13 +320,45 @@ def build_model(num_classes):
     return model
 
 
-def train(
+def train_rcnn(
     training_data_path,
     base_output_folder,
-    model_name=None,
     validation_data_path=None,
+    model_name=None,
     **kwargs,
 ):
+    """
+    Train a Faster-RCNN model using the specified configuration settings.
+
+    The function generates the following outputs:
+        - runs/<unique_fn>/          : TensorBoard event logs (loss curves, metrics)
+        - checkpoints/<unique_fn>/   : Saved training epochs and final model weights
+        - config.json                : Run configuration settings and hyperparameters
+        - model/<unique_fn>.pth      : Final trained model weights
+
+    Note: <unique_fn> is a filename generated by using the date and time and the
+    model_name parameter if set.
+
+    Parameters
+    ----------
+    training_data_path : str or Path
+        Path to the training annotation CSV-file.
+    base_output_folder : str or Path
+        Path to the base output folder.
+    validation_data_path : str or Path, optional
+        If provided, will use the file provided to run validation during the training loop. By default, None.
+    model_name : str, optional
+        If provided, appends the name to the model files. By default, None.
+    **kwargs : dict, optional
+        Arbitrary keyword arguments to override default parameters in
+        the `TrainingConfig` dataclass (e.g., `learning_rate`, `batch_size`,
+        `num_epochs`).
+
+    Returns
+    -------
+    Path
+        Path to the trained model.
+    """
 
     # Validate the base output folder
     base_output_folder = Path(base_output_folder)
@@ -226,8 +382,8 @@ def train(
     checkpoints_dir.mkdir(parents=True, exist_ok=False)
 
     # Generate and save the TrainingConfig
-    config = generate_training_config(**kwargs)
-    config.save(checkpoints_dir / "config.json")
+    config = TrainingConfig.from_args(**kwargs)
+    config.save(checkpoints_dir / (base_run_name + "_config.json"))
 
     # Set up the datasets
     training_dataset = TEMImageDataset(training_data_path, config)
@@ -254,7 +410,7 @@ def train(
 
     # Build the model
     num_classes = config.num_classes
-    model = build_model(num_classes)
+    model = build_rcnn_model(num_classes)
     model.to(device)
 
     # Set up the optimizer
@@ -318,7 +474,7 @@ def train(
         if (epoch + 1) % config.save_every_n_epochs == 0 or (
             epoch + 1
         ) == config.num_epochs:
-            ckpt_path = checkpoints_dir / f"follicle_detector_epoch_{epoch + 1}.pth"
+            ckpt_path = checkpoints_dir / f"{base_run_name}_rcnn_epoch_{epoch + 1}.pth"
             torch.save(model.state_dict(), ckpt_path)
             print(f"-> Checkpoint saved: {ckpt_path}")
 
@@ -344,101 +500,156 @@ def train(
     final_model_path = final_model_dir / (base_run_name + ".pth")
 
     torch.save(model.state_dict(), final_model_path)
+
+    # Also save the configuration in the completed model folder
+    config.save(final_model_dir / (base_run_name + "_config.json"))
+
     print("-------------------------------------------------------------")
     print(f"Training complete. Final weights saved to {final_model_path}")
 
     return final_model_path
 
 
-def generate_training_config(**kwargs):
-    """
-    Create a TrainingConfig dataclass.
-    """
-
-    # Initialize a TrainingConfig object
-    config = TrainingConfig()
-
-    # Validate the inputs
-    valid_fields = {f.name for f in dataclasses.fields(TrainingConfig)}
-    filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
-
-    # Update the TrainingConfig object
-    config = dataclasses.replace(config, **filtered_kwargs)
-
-    return config
+# ------------Prediction code------------------
 
 
-def clean_data(root_data_dir, base_output_dir):
+@dataclass
+class PredictionConfig:
+    rcnn_model_path: str = None
+    rcnn_confidence_thresh: float = 0.5
+    rcnn_save_boxes: bool = True
 
-    # This function should parse the directory tree and extract:
-    # CSV-files containing bounding boxes - renaming them with the mouse number
-    # Export images to PNG, also renaming them with the mouse number
+    _rcnn_config_path: str = None
 
-    root_data_dir = Path(root_data_dir)
+    use_segment_anything: bool = True
+    sam_checkpoint_path: str = "./sam_checkpoints/sam_vit_h_4b8939.pth"
+    sam_model_name: str = "vit_h"
 
-    base_output_dir = Path(base_output_dir)
-    base_output_dir.mkdir(parents=True, exist_ok=True)
+    def save(self, json_path):
+        """Saves the current configuration to a JSON file."""
+        json_path = Path(json_path)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
 
-    qpproj_path_list = list(root_data_dir.rglob("*.qpproj"))
+        config_dict = asdict(self)
+        config_dict["rcnn_config_path"] = config_dict.pop("_rcnn_config_path")
 
-    if not qpproj_path_list:
-        raise FileNotFoundError(f"No QuPath projects found at {root_data_dir}")
+        with open(json_path, "w") as f:
+            json.dump(config_dict, f, indent=4)
+        print(f"Configuration saved to JSON: {json_path}")
 
-    df_list = []
-    for qpproj_path in qpproj_path_list:
-        # Get the project parent folder
-        project_folder = qpproj_path.parent
+    @classmethod
+    def load(cls, json_path):
+        """Loads a TrainingConfig instance from an existing JSON file"""
+        json_path = Path(json_path)
+        if not json_path.exists():
+            raise FileNotFoundError(f"Configuration file not found at {json_path}")
 
-        # Get the Mouse number and the cell number from the project folder name
-        mouse_id = (project_folder.name).split("_")[1]
-        cell_id = (project_folder.name).split("_")[2]
+        with open(json_path, "r") as f:
+            data = json.load(f)
 
-        # Get the data from the export folder
-        export_path = project_folder / "export"
-        bbox_csv_list = list(export_path.glob("*_bounding_boxes.csv"))
+        # Filter out fields that might no longer exist in the dataclass
+        valid_fields = {f.name for f in fields(cls)}
 
-        if not bbox_csv_list:
-            raise FileNotFoundError(f"No CSV-files found at {export_path}")
+        filtered_data = {}
+        for k, v in data.items():
+            if k == "rcnn_model_path":
+                filtered_data["_rcnn_model_path"] = v
+            elif k in valid_fields:
+                filtered_data[k] = v
 
-        for bbox_csv in bbox_csv_list:
-            # Read in the data to a DataFrame
-            df = pd.read_csv(bbox_csv)
+        return cls(**filtered_data)
 
-            # Add the mouse number and cell number columns
-            df["Mouse ID"] = mouse_id
-            df["Cell ID"] = cell_id
+    def from_args(**kwargs):
+        """
+        Create a PredictionConfig dataclass from passed arguments
+        """
 
-            # Add the image name
-            image_name = (bbox_csv.stem).split("_")[0]
-            df["Image"] = image_name
+        # Initialize a TrainingConfig object
+        config = PredictionConfig()
 
-            # Find the image and record its path
-            image_path = (project_folder.parent) / f"{image_name}.dm4"
-            if image_path.is_file():
-                df["Image path"] = image_path
+        # Validate the inputs
+        valid_fields = {f.name for f in dataclasses.fields(PredictionConfig)}
+
+        filtered_kwargs = {}
+        for k, v in kwargs.items():
+            if k == "rcnn_model_path":
+                filtered_kwargs["_rcnn_model_path"] = v
+            elif k in valid_fields:
+                filtered_kwargs[k] = v
+
+        return dataclasses.replace(config, **filtered_kwargs)
+
+    @property
+    def rcnn_config_path(self):
+
+        if self._rcnn_config_path is not None:
+            return self._rcnn_config_path
+
+        # Try to obtain the path automatically
+        config_path = (
+            self.rcnn_model_path.parent / f"{self.rcnn_model_path.stem}_config.json"
+        )
+
+        if config_path.exists():
+            return config_path
+        else:
+            # Fallback - try to find the file recursively
+            p = list(
+                self.rcnn_model_path.parent.rglob(
+                    f"{self.rcnn_model_path.stem}_config.json"
+                )
+            )
+
+            if p:
+                return p[0]
             else:
-                raise FileNotFoundError(f"Could not find image at path {image_path}")
+                raise FileNotFoundError(
+                    f"Configuration file for {self.rcnn_model_path.name} was not found."
+                )
 
-            df_list.append(df)
 
-    merged_df = pd.concat(df_list)
+def segment_organelles(images, output_dir, **kwargs):
 
-    # Sort the rows by cell ID, then image
-    sorted_df = merged_df.sort_values(by=["Cell ID", "Image"])
+    # Parse the images input argument
+    if not isinstance(images, list):
+        images = [
+            images,
+        ]
 
-    # Organize the columns
-    front_cols = ["Mouse ID", "Cell ID", "Image"]
+    image_path_list = []
+    for p in images:
+        p = Path(p)
 
-    remaining_cols = [col for col in sorted_df.columns if col not in front_cols]
+        if p.is_file():
+            image_path_list.append(p)
+        elif p.is_dir():
+            # Find images
+            dm4_files = list(p.rglob("*.dm4"))
 
-    sorted_df = sorted_df[front_cols + remaining_cols]
+            if dm4_files:
+                image_path_list.extend(dm4_files)
+            else:
+                raise FileNotFoundError(f"No .dm4 files found in {p}")
 
-    # Write CSV-file
-    output_file = base_output_dir / f"mouse{mouse_id}.csv"
-    sorted_df.to_csv(output_file, index=False)
+    # Validate the output directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Output file written to: {output_file}")
-    return output_file
+    # Generate the PredictionConfig
+    pred_config = PredictionConfig.from_args(**kwargs)
+
+    # Predict bounding boxes
+    bbox_results = predict_bounding_boxes(
+        pred_config.rcnn_model_path,
+        pred_config.rcnn_config_path,
+        image_path_list,
+        output_dir=output_dir,
+        confidence_thresh=pred_config.rcnn_confidence_thresh,
+        save_geojson=pred_config.rcnn_save_boxes,
+    )
+
+    # Predict segmentation
+    segment_sam2(bbox_results, output_dir, pred_config)
 
 
 def predict_bounding_boxes(
@@ -450,15 +661,19 @@ def predict_bounding_boxes(
     save_geojson=True,
 ):
 
+    # Validate the inputs
     model_path = Path(model_path)
     if not model_path.is_file():
         raise FileNotFoundError(f"File not found at path: {model_path}")
+
+    config_path = Path(config_path)
 
     image_paths = [Path(p) for p in image_paths]
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Set up the prediction model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load the TrainingConfig
@@ -468,7 +683,7 @@ def predict_bounding_boxes(
     idx_to_class = {v: k for k, v in config.class_map.items()}
 
     # Build the model
-    model = build_model(config.num_classes)
+    model = build_rcnn_model(config.num_classes)
 
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -476,7 +691,7 @@ def predict_bounding_boxes(
     model.to(device)
     model.eval()
 
-    results = {}
+    results = []
     with torch.no_grad():
         for img_path in image_paths:
             img_tensor = image_to_tensor(img_path)
@@ -490,12 +705,6 @@ def predict_bounding_boxes(
             labels = predictions["labels"].cpu().numpy()[keep]
             filtered_scores = scores[keep]
 
-            results[img_path] = {
-                "boxes": boxes,
-                "labels": labels,
-                "scores": filtered_scores,
-            }
-
             # Save data in raw format for SAM2 prediction
             raw_results = {
                 "image_path": str(img_path),
@@ -503,6 +712,7 @@ def predict_bounding_boxes(
                 "labels": labels.tolist(),
                 "scores": filtered_scores.tolist(),
             }
+            results.append(raw_results)
 
             output_fn = img_path.stem
             json_file_path = output_dir / f"{output_fn}_bbox.json"
@@ -554,28 +764,38 @@ def predict_bounding_boxes(
     return results
 
 
-# TODO: Use SAM to infer the segmentation, convert to GeoJSON
-def segment_sam2(bbox_paths, output_dir):
+def segment_sam2(bbox, output_dir, config: PredictionConfig):
 
-    bbox_paths = {Path(p) for p in bbox_paths}
+    from segment_anything import SamPredictor, sam_model_registry
+
+    # Build the SAM model
+    sam = sam_model_registry[config.sam_model_name](
+        checkpoint=config.sam_checkpoint_path
+    )
+
+    predictor = SamPredictor(sam)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    from segment_anything import SamPredictor, sam_model_registry
+    if not isinstance(bbox, list):
+        bbox = [bbox]
 
-    sam = sam_model_registry["vit_h"](
-        checkpoint="./sam_checkpoints/sam_vit_h_4b8939.pth"
-    )
-    predictor = SamPredictor(sam)
+    sam2_results = []
+    for b in bbox:
+        if isinstance(b, dict):
+            rcnn_results = b
+        elif isinstance(b, (str, Path)):
+            with open(b, "r") as f:
+                rcnn_results = json.load(f)
+        else:
+            raise ValueError(
+                f"Expected input to be a results dict or a path to a CSV-file. Instead it is a {type(b).__name__}"
+            )
 
-    for results_path in bbox_paths:
-        with open(results_path, "r") as f:
-            results = json.load(f)
-
-        img_path = Path(results["image_path"])
+        img_path = Path(rcnn_results["image_path"])
         # Reshape boxes into (N, 4)
-        boxes = np.array(results["boxes"], dtype=np.float32)
+        boxes = np.array(rcnn_results["boxes"], dtype=np.float32)
 
         s = hs.load(img_path)
         image_np = s.data
@@ -603,7 +823,73 @@ def segment_sam2(bbox_paths, output_dir):
             segmentation_masks.append(masks)
             segmentation_scores.append(scores)
 
-    return segmentation_masks, segmentation_scores
+        # Convert to GeoJSON QuPath object
+        features = []
+        obj_idx = 0
+        for idx, mask in enumerate(segmentation_masks):
+            mask = masks[idx].squeeze()
+
+            label = b.label[idx]
+
+            feature = mask_to_geojson_feature(mask, label, scores[idx], obj_idx)
+            if feature:
+                features.append(feature)
+                obj_idx += 1
+
+        geojson_data = {"type": "FeatureCollection", "features": features}
+
+        # Save the objects
+        output_geojson_path = output_dir / "test_annotations.geojson"
+        with open(output_geojson_path, "w") as f:
+            json.dump(geojson_data, f, indent=2)
+
+        print(f"GeoJSON exported to: {output_geojson_path}")
+
+        # Create the results dict
+        sam2_results.append(
+            {
+                "image_path": rcnn_results.im,
+                "masks": segmentation_masks,
+                "scores": segmentation_scores,
+            }
+        )
+
+    return sam2_results
+
+
+def mask_to_geojson_feature(mask, label, score, object_id):
+
+    binary_mask = (mask.astype(np.uint8)) * 255
+    contours, _ = cv2.findContours(
+        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return None
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    epsilon = 0.001 * cv2.arcLength(largest_contour, True)
+    approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+    coords = approx_contour.squeeze(axis=1).tolist()
+
+    if len(coords) < 3:
+        return None
+
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+
+    feature = {
+        "type": "Feature",
+        "id": f"detection_{object_id}",
+        "geometry": {"type": "Polygon", "coordinates": [coords]},
+        "properties": {
+            "objectType": "annotation",
+            "classification": {"name": str(label)},
+            "confidence": score,
+        },
+    }
+    return feature
 
 
 # def download_sam2_weights(checkpoint_name: str = "sam2.1_hiera_large.pt"):

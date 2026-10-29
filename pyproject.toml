@@ -19,6 +19,7 @@ dependencies = [
     "tensorboard>=2.21.0",
     "pip>=26.2.2",
     "segment-anything",
+    "opencv-python>=5.0.0.93",
 ]
 
 [project.optional-dependencies]
