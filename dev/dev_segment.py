@@ -4,6 +4,7 @@ segment_organelles(
     "../data/Dataset01/raw/Mouse194/Cell1/3.dm4",
     "../test_train/prediction/20261028",
     rcnn_model_path="../test_train/model/20261027_141454test_1.pth",
+    rcnn_config_path="../test_train/checkpoints/20261027_141454test_1/config.json",
 )
 
 

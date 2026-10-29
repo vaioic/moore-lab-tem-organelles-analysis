@@ -269,6 +269,8 @@ def read_image(image_path):
     image = image.astype(np.float32)
     image = (image - image.min()) / (image.max() - image.min() + 1e-8)
 
+    return image
+
 
 def image_to_tensor(image):
     """
@@ -552,8 +554,8 @@ class PredictionConfig:
 
         filtered_data = {}
         for k, v in data.items():
-            if k == "rcnn_model_path":
-                filtered_data["_rcnn_model_path"] = v
+            if k == "rcnn_config_path":
+                filtered_data["_rcnn_config_path"] = v
             elif k in valid_fields:
                 filtered_data[k] = v
 
@@ -572,8 +574,8 @@ class PredictionConfig:
 
         filtered_kwargs = {}
         for k, v in kwargs.items():
-            if k == "rcnn_model_path":
-                filtered_kwargs["_rcnn_model_path"] = v
+            if k == "rcnn_config_path":
+                filtered_kwargs["_rcnn_config_path"] = v
             elif k in valid_fields:
                 filtered_kwargs[k] = v
 
@@ -586,25 +588,20 @@ class PredictionConfig:
             return self._rcnn_config_path
 
         # Try to obtain the path automatically
-        config_path = (
-            self.rcnn_model_path.parent / f"{self.rcnn_model_path.stem}_config.json"
-        )
+        p = Path(self.rcnn_model_path)
+        config_path = p.parent / f"{p.stem}_config.json"
 
         if config_path.exists():
             return config_path
         else:
             # Fallback - try to find the file recursively
-            p = list(
-                self.rcnn_model_path.parent.rglob(
-                    f"{self.rcnn_model_path.stem}_config.json"
-                )
-            )
+            p = list(p.parent.rglob(f"{p.stem}_config.json"))
 
             if p:
                 return p[0]
             else:
                 raise FileNotFoundError(
-                    f"Configuration file for {self.rcnn_model_path.name} was not found."
+                    f"Configuration file for {self.rcnn_model_path} was not found."
                 )
 
 
@@ -694,7 +691,7 @@ def predict_bounding_boxes(
     results = []
     with torch.no_grad():
         for img_path in image_paths:
-            img_tensor = image_to_tensor(img_path)
+            img_tensor = image_to_tensor(read_image(img_path))
             img_tensor = img_tensor.unsqueeze(0).to(device)
 
             predictions = model(img_tensor)[0]
@@ -827,11 +824,13 @@ def segment_sam2(bbox, output_dir, config: PredictionConfig):
         features = []
         obj_idx = 0
         for idx, mask in enumerate(segmentation_masks):
-            mask = masks[idx].squeeze()
+            mask = mask.squeeze()
 
-            label = b.label[idx]
+            label = b["labels"][idx]
 
-            feature = mask_to_geojson_feature(mask, label, scores[idx], obj_idx)
+            feature = mask_to_geojson_feature(
+                mask, label, segmentation_scores[idx], obj_idx
+            )
             if feature:
                 features.append(feature)
                 obj_idx += 1
@@ -848,7 +847,7 @@ def segment_sam2(bbox, output_dir, config: PredictionConfig):
         # Create the results dict
         sam2_results.append(
             {
-                "image_path": rcnn_results.im,
+                "image_path": rcnn_results["image_path"],
                 "masks": segmentation_masks,
                 "scores": segmentation_scores,
             }
@@ -879,14 +878,21 @@ def mask_to_geojson_feature(mask, label, score, object_id):
     if coords[0] != coords[-1]:
         coords.append(coords[0])
 
+    # Safely convert the score (whether array or scalar) to a Python float
+    if isinstance(score, np.ndarray):
+        score_val = float(score.item() if score.size == 1 else score[0])
+    else:
+        score_val = float(score)
+
+    # TODO: Convert the label integer back to string
     feature = {
         "type": "Feature",
         "id": f"detection_{object_id}",
         "geometry": {"type": "Polygon", "coordinates": [coords]},
         "properties": {
             "objectType": "annotation",
-            "classification": {"name": str(label)},
-            "confidence": score,
+            "classification": str(label),
+            "confidence": score_val,
         },
     }
     return feature
